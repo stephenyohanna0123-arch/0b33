@@ -6,3 +6,4 @@ data:
   timestamp: <u64>
   schema_version: 4
   batch_nonce: <Option<u64>>
+  contract_id: <Address>

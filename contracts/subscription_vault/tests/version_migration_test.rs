@@ -121,8 +121,8 @@ fn test_migration_dry_run_is_read_only_and_matches_applied_plan() {
     assert_eq!(preview.from_version, 2);
     assert_eq!(preview.to_version, client.version());
     assert_eq!(preview.config_keys_to_migrate, 2);
-    assert_eq!(preview.subscriptions_for_ledger_expiration, 0);
-    assert_eq!(preview.subscriptions_for_sub_account_label, 0);
+    assert_eq!(preview.subs_for_ledger_expiry, 0);
+    assert_eq!(preview.subs_for_sub_account_label, 0);
     assert!(preview.dry_run);
     assert!(preview.would_change);
     assert_eq!(env.events().all().len(), events_before);
@@ -138,12 +138,12 @@ fn test_migration_dry_run_is_read_only_and_matches_applied_plan() {
     assert_eq!(applied.to_version, preview.to_version);
     assert_eq!(applied.config_keys_to_migrate, preview.config_keys_to_migrate);
     assert_eq!(
-        applied.subscriptions_for_ledger_expiration,
-        preview.subscriptions_for_ledger_expiration
+        applied.subs_for_ledger_expiry,
+        preview.subs_for_ledger_expiry
     );
     assert_eq!(
-        applied.subscriptions_for_sub_account_label,
-        preview.subscriptions_for_sub_account_label
+        applied.subs_for_sub_account_label,
+        preview.subs_for_sub_account_label
     );
     assert!(!applied.dry_run);
     let committed_version = client.version();

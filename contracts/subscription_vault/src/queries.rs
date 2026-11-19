@@ -20,6 +20,7 @@
 //! | `get_merchant_subscription_count` | Index length (u32) | ✅ Yes | None |
 //! | `get_token_subscription_count` | Index length (u32) | ✅ Yes | None |
 //! | `get_subscriptions_by_token` | Slice of subscription records | ✅ Yes | None |
+//! | `list_subscriptions_by_token` | Paginated subscription records with cursor | ✅ Yes | None |
 //! | `get_next_charge_info` | Projected next-charge timestamp and status | ✅ Yes | None |
 //! | `compute_next_charge_info` | Pure computation on a Subscription value | ✅ Yes | None |
 //! | `get_cap_info` | Lifetime cap / charged totals | ✅ Yes | None |
@@ -76,12 +77,21 @@
 //!   Results are ascending by id. Continue with `next_cursor` when present; when it is `None`
 //!   the scan reached the end of the ID space and enumeration is complete, so an empty page
 //!   with `None` means nothing is stranded. Each call inspects at most `MAX_SCAN_DEPTH` ids.
-//! - **`get_subscriptions_by_merchant`** / **`get_subscriptions_by_token`**: Results follow the
-//!   order of ids in the on-chain index (`MerchantSubs` / `token_subs`), which is insertion
-//!   order (ascending id order for subscriptions created through this contract). `start` is a
-//!   0-based offset into that id list. Missing subscription records are skipped; callers should
-//!   use [`get_merchant_subscription_count`] or [`get_token_subscription_count`] for the index
-//!   length, not `result.len()`, when paginating.
+//! - **`get_subscriptions_by_merchant`**: Results follow the order of ids in the on-chain index
+//!   (`MerchantSubs`), which is insertion order (ascending id order for subscriptions created
+//!   through this contract). `start` is a 0-based offset into that id list. Passing
+//!   `reverse = true` walks the same index from its end, returning newest-first
+//!   (reverse-chronological) results without inverting the index. Missing subscription records
+//!   are skipped; callers should use [`get_merchant_subscription_count`] for the index length,
+//!   not `result.len()`, when paginating.
+//! - **`get_subscriptions_by_merchant_paginated`**: Cursor-based variant of the above. The
+//!   cursor is an offset into whichever ordering `reverse` selects, so cursors are
+//!   direction-specific and must be replayed with the same `reverse` value.
+//! - **`get_subscriptions_by_token`**: Results follow the order of ids in the on-chain index
+//!   (`token_subs`), which is insertion order. `start` is a 0-based offset into that id list.
+//! - **`list_subscriptions_by_token`**: Cursor-based traversal of the same token index in
+//!   insertion order. `cursor` is a 0-based offset (`None` starts at the beginning); continue
+//!   with `next_cursor`. The returned `total` is the token index length.
 //!
 //! ## Read complexity per endpoint
 //!
@@ -93,6 +103,7 @@
 //! | `get_subscriptions_by_merchant_paginated` | 1 + limit | 1 index read + up to `limit` sub reads |
 //! | `get_merchant_subscription_count` | 1 | Index length only |
 //! | `get_subscriptions_by_token` | 1 + limit | 1 index read + up to `limit` sub reads |
+//! | `list_subscriptions_by_token` | 1 + limit | 1 index read + up to `limit` sub reads |
 //! | `get_token_subscription_count` | 1 | Index length only |
 //! | `compute_next_charge_info` | 0 | Pure computation |
 //! | `get_cap_info` | 1 | Calls `get_subscription` |
@@ -100,12 +111,12 @@
 //! | `list_subscriptions_by_subscriber` | 1 + up to MAX_SCAN_DEPTH | 1 index read + capped scan of that subscriber's ids |
 //! | `list_recoverable_subscriptions` | up to MAX_SCAN_DEPTH | Capped full-ID scan; cancelled subs are absent from every secondary index |
 //!
-//! **Index deserialization note**: `get_subscriptions_by_merchant` and
-//! `get_subscriptions_by_token` read the entire index `Vec<u32>` from a single storage
-//! key before slicing it. For merchants or tokens with very large index lists the
-//! deserialization cost grows with the list length, even when only `limit` entries
-//! are needed. Use [`get_merchant_subscription_count`] / [`get_token_subscription_count`]
-//! to estimate index size before paginating.
+//! **Index deserialization note**: merchant and token subscription queries read the
+//! entire index `Vec<u32>` from a single storage key before slicing it. For merchants
+//! or tokens with very large index lists the deserialization cost grows with the list
+//! length, even when only `limit` entries are needed. Use
+//! [`get_merchant_subscription_count`] / [`get_token_subscription_count`] to estimate
+//! index size before paginating.
 //!
 //! ## Key registry: DataKey variants used here
 //! - `DataKey::Sub(u32)`
@@ -115,16 +126,23 @@
 //! - `DataKey::NextId`
 
 use crate::safe_math::{safe_mul, safe_sub};
-use crate::subscription::extend_subscription_ttl;
+use crate::subscription::read_subscription;
 use crate::types::{
     CapInfo, DataKey, Error, NextChargeInfo, Subscription, SubscriptionStatus,
-    SubscriptionsMerchantPage,
+    SubscriptionsMerchantPage, SubscriptionsTokenPage,
 };
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 /// Maximum `limit` for [`get_subscriptions_by_merchant`] and [`get_subscriptions_by_token`]
 /// (aligned with [`list_subscriptions_by_subscriber`]).
 pub const MAX_SUBSCRIPTION_LIST_PAGE: u32 = 100;
+
+/// Maximum offset that [`get_subscriptions_by_merchant_paginated`] will serve.
+///
+/// This bounds total enumeration across chained pages, not just the work in a
+/// single call. Once the cursor reaches this depth, the query returns an empty
+/// terminal page.
+pub const MAX_MERCHANT_CURSOR_DEPTH: u32 = 1_000;
 
 /// Hard upper bound on the `limit` parameter for [`list_subscriptions_by_subscriber`].
 ///
@@ -153,13 +171,7 @@ pub const MAX_QUERY_RESULTS: u32 = 100;
 pub const MAX_SCAN_DEPTH: u32 = 1_000;
 
 pub fn get_subscription(env: &Env, subscription_id: u32) -> Result<Subscription, Error> {
-    let key = DataKey::Sub(subscription_id);
-    let mut sub: Subscription = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .ok_or(Error::NotFound)?;
-    extend_subscription_ttl(env, &key);
+    let mut sub = read_subscription(env, subscription_id).ok_or(Error::NotFound)?;
 
     // `GracePeriod` is persisted, but the transition out of it only happens on
     // the next charge attempt. If the grace window has already elapsed with no
@@ -201,14 +213,55 @@ pub fn estimate_topup_for_intervals(
     Ok(topup)
 }
 
+/// Reads up to `limit` subscription records starting at logical offset `start`
+/// into a merchant's id index.
+///
+/// When `reverse` is `true`, the index is traversed from its end so the newest
+/// subscriptions (highest ids) come first. The index is never copied or
+/// reordered: each logical position is mapped to a physical index with
+/// `len - 1 - position`, so the storage cost stays `1 + limit` reads regardless
+/// of the ordering chosen.
+fn read_merchant_page(
+    env: &Env,
+    ids: &Vec<u32>,
+    start: u32,
+    limit: u32,
+    reverse: bool,
+) -> Vec<Subscription> {
+    let len = ids.len();
+    let end = start.saturating_add(limit).min(len);
+    let mut out = Vec::new(env);
+    let mut position = start;
+    while position < end {
+        let index = if reverse {
+            len - 1 - position
+        } else {
+            position
+        };
+        if let Some(sub_id) = ids.get(index) {
+            if let Some(sub) = read_subscription(env, sub_id) {
+                out.push_back(sub);
+            }
+        }
+        position += 1;
+    }
+    out
+}
+
 /// Returns subscriptions for a merchant, paginated by offset into the merchant id index.
 ///
-/// `limit` must be in `1..=MAX_SUBSCRIPTION_LIST_PAGE`. Ordering is stable index order (insertion order).
+/// `limit` must be in `1..=MAX_SUBSCRIPTION_LIST_PAGE`.
+///
+/// `reverse = false` returns results in stable index order (insertion order,
+/// oldest first). `reverse = true` returns them in reverse-chronological order
+/// (newest first) without materialising or inverting the whole index. `start`
+/// always counts from the beginning of the selected ordering.
 pub fn get_subscriptions_by_merchant(
     env: &Env,
     merchant: Address,
     start: u32,
     limit: u32,
+    reverse: bool,
 ) -> Result<Vec<Subscription>, Error> {
     if limit == 0 || limit > MAX_SUBSCRIPTION_LIST_PAGE {
         return Err(Error::InvalidInput);
@@ -216,28 +269,11 @@ pub fn get_subscriptions_by_merchant(
     let key = DataKey::MerchantSubs(merchant);
     let ids: Vec<u32> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
 
-    let len = ids.len();
-    if start >= len {
+    if start >= ids.len() {
         return Ok(Vec::new(env));
     }
 
-    let end = if start + limit > len {
-        len
-    } else {
-        start + limit
-    };
-
-    let mut result = Vec::new(env);
-    for sub_id in ids.iter().skip(start as usize).take((end - start) as usize) {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(sub_id))
-        {
-            result.push_back(sub);
-        }
-    }
-    Ok(result)
+    Ok(read_merchant_page(env, &ids, start, limit, reverse))
 }
 
 /// Returns the number of subscriptions for a given merchant.
@@ -251,9 +287,12 @@ pub fn get_merchant_subscription_count(env: &Env, merchant: Address) -> u32 {
 ///
 /// # Arguments
 /// - `merchant`: The merchant address whose subscriptions to fetch
-/// - `cursor`: Optional starting position (0-based index into the merchant's subscription list).
-///   Pass `None` to start from the beginning.
+/// - `cursor`: Optional starting position (0-based offset into the merchant's
+///   subscription list *as ordered by `reverse`*). Pass `None` to start from the
+///   beginning.
 /// - `limit`: Number of subscriptions to return (must be in `1..=MAX_SUBSCRIPTION_LIST_PAGE`)
+/// - `reverse`: `false` for oldest-first (insertion order), `true` for
+///   newest-first (reverse-chronological)
 ///
 /// # Returns
 /// A `SubscriptionsMerchantPage` containing:
@@ -261,17 +300,30 @@ pub fn get_merchant_subscription_count(env: &Env, merchant: Address) -> u32 {
 /// - `next_cursor`: Offset to use for the next page (if more results exist)
 /// - `total`: Total number of subscriptions for this merchant
 ///
+/// Cursor traversal is capped at [`MAX_MERCHANT_CURSOR_DEPTH`] index entries.
+/// The page is truncated at that boundary, and requests at or beyond it return
+/// an empty terminal page (a tombstone) with `next_cursor == None`.
+///
 /// # Errors
 /// - `InvalidInput` if limit is 0 or exceeds `MAX_SUBSCRIPTION_LIST_PAGE`
 ///
 /// # Ordering
-/// Results follow insertion order (ascending subscription ID order) from the merchant's index.
-/// Missing subscription records are skipped; use `total` to determine the actual count.
+/// With `reverse = false`, results follow insertion order (ascending
+/// subscription ID order). With `reverse = true`, the index is walked from its
+/// end so the newest subscriptions come first; the index itself is never
+/// inverted. Missing subscription records are skipped; use `total` to determine
+/// the actual count.
+///
+/// Cursors are **direction-specific**: `next_cursor` is an offset into the
+/// ordering that produced it, so replay it with the same `reverse` value.
+/// Mixing orderings with a cursor from the other direction yields an undefined
+/// page.
 pub fn get_subscriptions_by_merchant_paginated(
     env: &Env,
     merchant: Address,
     cursor: Option<u32>,
     limit: u32,
+    reverse: bool,
 ) -> Result<SubscriptionsMerchantPage, Error> {
     if limit == 0 || limit > MAX_SUBSCRIPTION_LIST_PAGE {
         return Err(Error::InvalidInput);
@@ -282,7 +334,7 @@ pub fn get_subscriptions_by_merchant_paginated(
     let total = ids.len();
 
     let start = cursor.unwrap_or(0);
-    if start >= total {
+    if start >= total || start >= MAX_MERCHANT_CURSOR_DEPTH {
         return Ok(SubscriptionsMerchantPage {
             subscriptions: Vec::new(env),
             next_cursor: None,
@@ -290,24 +342,17 @@ pub fn get_subscriptions_by_merchant_paginated(
         });
     }
 
-    let end = if start + limit > total {
-        total
+    let end = start
+        .saturating_add(limit)
+        .min(total)
+        .min(MAX_MERCHANT_CURSOR_DEPTH);
+    let subscriptions = read_merchant_page(env, &ids, start, end - start, reverse);
+
+    let next_cursor = if end < total && end < MAX_MERCHANT_CURSOR_DEPTH {
+        Some(end)
     } else {
-        start + limit
+        None
     };
-
-    let mut subscriptions = Vec::new(env);
-    for sub_id in ids.iter().skip(start as usize).take((end - start) as usize) {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(sub_id))
-        {
-            subscriptions.push_back(sub);
-        }
-    }
-
-    let next_cursor = if end < total { Some(end) } else { None };
 
     Ok(SubscriptionsMerchantPage {
         subscriptions,
@@ -348,15 +393,55 @@ pub fn get_subscriptions_by_token(
     };
     let mut out = Vec::new(env);
     for id in ids.iter().skip(start as usize).take((end - start) as usize) {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             out.push_back(sub);
         }
     }
     Ok(out)
+}
+
+/// Returns subscriptions for a settlement token with cursor-based pagination.
+///
+/// Results follow insertion order in the token index. `cursor` is a 0-based
+/// offset; pass the returned `next_cursor` to fetch the next page. `total`
+/// reports the current number of IDs in the token index.
+///
+/// `limit` must be in `1..=MAX_SUBSCRIPTION_LIST_PAGE`.
+pub fn list_subscriptions_by_token(
+    env: &Env,
+    token: Address,
+    cursor: Option<u32>,
+    limit: u32,
+) -> Result<SubscriptionsTokenPage, Error> {
+    if limit == 0 || limit > MAX_SUBSCRIPTION_LIST_PAGE {
+        return Err(Error::InvalidInput);
+    }
+
+    let key = DataKey::TokenSubs(token);
+    let ids: Vec<u32> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
+    let total = ids.len();
+    let start = cursor.unwrap_or(0);
+    if start >= total {
+        return Ok(SubscriptionsTokenPage {
+            subscriptions: Vec::new(env),
+            next_cursor: None,
+            total,
+        });
+    }
+
+    let end = start.saturating_add(limit).min(total);
+    let mut subscriptions = Vec::new(env);
+    for id in ids.iter().skip(start as usize).take((end - start) as usize) {
+        if let Some(subscription) = read_subscription(env, id) {
+            subscriptions.push_back(subscription);
+        }
+    }
+
+    Ok(SubscriptionsTokenPage {
+        subscriptions,
+        next_cursor: if end < total { Some(end) } else { None },
+        total,
+    })
 }
 
 /// Returns full next charge information for a subscription.
@@ -391,13 +476,9 @@ pub fn compute_next_charge_info(env: &Env, subscription: &Subscription) -> NextC
         SubscriptionStatus::Archived => soroban_sdk::symbol_short!("archived"),
     };
 
-    let grace_deadline = if subscription.status == SubscriptionStatus::GracePeriod {
-        subscription
-            .grace_start_timestamp
-            .map(|start| start.saturating_add(crate::admin::get_grace_period(env).unwrap_or(0)))
-    } else {
-        None
-    };
+    let grace_deadline = subscription
+        .grace_start_timestamp
+        .map(|start| start.saturating_add(crate::admin::get_grace_period(env).unwrap_or(0)));
 
     NextChargeInfo {
         next_charge_timestamp,
@@ -417,7 +498,10 @@ pub fn get_cap_info(env: &Env, subscription_id: u32) -> Result<CapInfo, Error> {
     let (remaining_cap, cap_reached) = match sub.lifetime_cap {
         Some(cap) => {
             let remaining = crate::subscription::lifetime_cap_remaining(cap, sub.lifetime_charged);
-            (Some(remaining), crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged))
+            (
+                Some(remaining),
+                crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged),
+            )
         }
         None => (None, false),
     };
@@ -635,11 +719,7 @@ pub fn list_recoverable_subscriptions(
         }
         scanned += 1;
 
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(cursor_id))
-        {
+        if let Some(sub) = read_subscription(env, cursor_id) {
             if sub.status == SubscriptionStatus::Cancelled && sub.prepaid_balance > 0 {
                 if subscriptions.len() < limit {
                     subscriptions.push_back(RecoverableSubscription {
@@ -909,11 +989,7 @@ pub fn query_prepaid_balances_paginated(
     let mut subscriptions_count: u32 = 0;
 
     for id in request.start_subscription_id..scan_end {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == request.token && sub.prepaid_balance > 0 {
                 partial_total = partial_total.saturating_add(sub.prepaid_balance);
                 subscriptions_count = subscriptions_count.saturating_add(1);
@@ -940,11 +1016,7 @@ fn compute_total_prepaid(env: &Env, token: &Address) -> i128 {
 
     let mut total: i128 = 0;
     for id in 0..next_id {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == *token {
                 total = total.saturating_add(sub.prepaid_balance);
             }
@@ -959,11 +1031,7 @@ fn compute_total_prepaid_with_count(env: &Env, token: &Address) -> (i128, u32) {
     let mut total: i128 = 0;
     let mut count: u32 = 0;
     for id in 0..next_id {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
+        if let Some(sub) = read_subscription(env, id) {
             if sub.token == *token && sub.prepaid_balance > 0 {
                 total = total.saturating_add(sub.prepaid_balance);
                 count = count.saturating_add(1);

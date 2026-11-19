@@ -34,17 +34,21 @@ withdrawal or redirect an accounted balance to a new address.
    not enough by itself.
 2. **Reconcile and prepare approval.** Call the public,
    unauthenticated `get_token_reconciliation(token)` query. Confirm
-   `is_balanced == true` and `recoverable_amount >= amount`, and preserve the
-   returned values as evidence. Where guardians are configured, create a
+   `is_balanced == true` and preserve the returned values as evidence. The
+   recovery is capped at `recoverable_amount`, which excludes prepaid balances
+   and other accounted liabilities. Where guardians are configured, create a
    `RecoverStrandedFunds` governance proposal matching the recipient, token,
-   and amount; it must pass quorum and its timelock before execution. Without
-   configured guardians, the contract retains its single-admin compatibility
-   path.
+   and amount expected to be transferred after that cap; it must pass quorum
+   and its timelock before execution. Without configured guardians, the
+   contract retains its single-admin compatibility path.
 3. **Submit the recovery.** The configured admin calls
    `recover_stranded_funds(admin, token, recipient, amount, recovery_id,
    reason)` and authorizes the transaction with the admin key. Use a unique
-   `recovery_id`; the contract rejects reuse. When guardians are configured,
-   the proposal must match the operation and be approved before the call.
+   `recovery_id`; the contract rejects reuse. The result reports
+   `recovered_amount` and `surplus_amount` (the requested amount that exceeded
+   the available recoverable balance). When guardians are configured, the
+   proposal must match the capped transfer amount and be approved before the
+   call.
 4. **Verify the transaction and event.** Confirm the transaction succeeded and
    inspect its `recovery` event. Check the admin, recipient, token, amount,
    reason, and timestamp against the proposal and incident record. The token
@@ -224,7 +228,8 @@ and has no `subscription_id` parameter. The only balance gate is:
 
 ```rust
 recoverable = contract_balance - total_accounted(token)
-if amount > recoverable { return Err(Error::InsufficientBalance); }
+recovered_amount = min(amount, max(recoverable, 0))
+surplus_amount = amount - recovered_amount
 ```
 
 `total_accounted` aggregates every subscriber prepaid balance, every merchant
@@ -277,17 +282,17 @@ evidence, that:
    withdrawal and must be resolved first).
 
 If step 3 cannot be demonstrated, the correct path is to let the subscriber
-withdraw. Attempting recovery of accounted funds returns
-`Error::InsufficientBalance` and — if forced through a state bug — would be a
-governance violation.
+withdraw. A recovery request cannot draw on accounted funds; if no unaccounted
+balance exists, it returns `recovered_amount: 0` and reports the request as
+`surplus_amount`.
 
 ### What an admin sees when they try
 
 | Attempt | Result |
 |---------|--------|
-| Recover the refund of a `Cancelled` subscription whose escrow is still accounted | `Error::InsufficientBalance` (code `1001`) — `amount > recoverable` |
-| Recover the refund of a `Cancelled` subscription after the subscriber already withdrew | `Error::InsufficientBalance` — the funds left the contract entirely |
-| Recover the refund of a `Cancelled` subscription, amount within an unrelated surplus | Succeeds only for the surplus. The escrowed portion is never included in the `amount`. Do not net the two: net recoveries look like theft in the audit trail. |
+| Recover the refund of a `Cancelled` subscription whose escrow is still accounted | Transfers no escrowed funds; reports `recovered_amount: 0` if no unrelated recoverable balance exists |
+| Recover the refund of a `Cancelled` subscription after the subscriber already withdrew | Transfers no funds if the contract has no unaccounted balance |
+| Request more than an unrelated surplus | Succeeds only for the available surplus and reports the excess request as `surplus_amount`. The escrowed portion is never included. Do not net the two: net recoveries look like theft in the audit trail. |
 | Recover a genuinely orphaned, unaccounted escrow after an upgrade/migration bug | Succeeds with `RecoveryReason::ExpiredEscrow` and the evidence above |
 
 ### Support checklist for a cancelled subscription
@@ -350,7 +355,8 @@ if admin != stored_admin {
 
 - Amount must be positive (> 0)
 - Prevents accidental calls with zero or negative values
-- Amount must be less than or equal to the available recoverable balance
+- Recovery is capped at the available recoverable balance
+- Any excess request is reported as `surplus_amount` in `RecoveryResult`
 - Recoverable balance is calculated as `actual_token_balance - total_accounted_balance` to ensure user and merchant active funds are strictly protected.
 
 ```rust
@@ -358,10 +364,9 @@ if amount <= 0 {
     return Err(Error::InvalidRecoveryAmount);
 }
 
-let recoverable = contract_balance.checked_sub(accounted_balance)?;
-if amount > recoverable {
-    return Err(Error::InsufficientBalance);
-}
+let recoverable = contract_balance.checked_sub(accounted_balance)?.max(0);
+let recovered_amount = amount.min(recoverable);
+let surplus_amount = amount - recovered_amount;
 ```
 
 #### 2.1 Replay Protection

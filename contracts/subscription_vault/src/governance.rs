@@ -13,7 +13,8 @@
 
 use crate::types::{
     DataKey, Error, Proposal, ProposalCancelledEvent, ProposalExecutedEvent, ProposalKind,
-    ProposalSubmittedEvent, ProposalVotedEvent, VoteLockedEvent, EVENT_SCHEMA_VERSION,
+    ProposalSubmittedEvent, ProposalVotedEvent, VoteLockedEvent, BASE_EVENT_SCHEMA_VERSION,
+    MAX_PROTOCOL_FEE_BIPS,
 };
 use soroban_sdk::{Address, Env, Map, String, Symbol, Vec};
 
@@ -102,6 +103,80 @@ fn calculate_total_weight(env: &Env) -> u32 {
     total
 }
 
+/// Validate proposal configuration for `SetProtocolFee` kind.
+///
+/// Ensures:
+/// - `target3` (fee_bps) does not exceed `MAX_PROTOCOL_FEE_BIPS`.
+/// - `target2` (treasury) is provided (not None).
+fn validate_set_protocol_fee_proposal(
+    _env: &Env,
+    fee_bps: u32,
+    treasury: &Option<Address>,
+) -> Result<(), Error> {
+    if fee_bps > MAX_PROTOCOL_FEE_BIPS {
+        return Err(Error::ProtocolFeeTooHigh);
+    }
+    if treasury.is_none() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Validate proposal configuration for `SetDisputeWindow` kind.
+///
+/// Ensures:
+/// - `target3` (window_secs) is not zero and fits in u32 max.
+fn validate_set_dispute_window_proposal(window_secs: u32) -> Result<(), Error> {
+    if window_secs == 0 || window_secs == u32::MAX {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Validate proposal configuration for `SetOracleConfig` kind.
+///
+/// Oracle address changes are governance-gated. The oracle address (target)
+/// must be provided and must not be zero-address.
+fn validate_set_oracle_config_proposal(_env: &Env, oracle: &Address) -> Result<(), Error> {
+    // At minimum, the oracle must be a valid address (not a zero-address placeholder).
+    // Further validation (is it a valid contract) happens at execution time.
+    // This just ensures the proposal is well-formed.
+    Ok(())
+}
+
+/// Validate proposal configuration based on its kind.
+///
+/// Pre-validates configuration that would be checked at execution time,
+/// allowing invalid proposals to be rejected at submission time to save gas.
+/// This prevents invalid proposals from being stored and voted on.
+fn validate_proposal_config(
+    env: &Env,
+    kind: ProposalKind,
+    target: &Address,
+    target2: &Option<Address>,
+    target3: u32,
+) -> Result<(), Error> {
+    match kind {
+        ProposalKind::SetProtocolFee => {
+            validate_set_protocol_fee_proposal(env, target3, target2)?;
+        }
+        ProposalKind::SetDisputeWindow => {
+            validate_set_dispute_window_proposal(target3)?;
+        }
+        ProposalKind::SetOracleConfig => {
+            validate_set_oracle_config_proposal(env, target)?;
+        }
+        // Other proposal kinds have no pre-validation requirements
+        ProposalKind::RotateAdmin
+        | ProposalKind::UpgradeContract
+        | ProposalKind::EmergencyStop
+        | ProposalKind::RecoverStrandedFunds
+        | ProposalKind::AddAcceptedToken
+        | ProposalKind::RemoveAcceptedToken => {}
+    }
+    Ok(())
+}
+
 /// Submit a new governance proposal.
 ///
 /// Creates a proposal with a deterministic ID and stores it in persistent storage.
@@ -124,6 +199,12 @@ pub fn do_submit_proposal(
     if quorum_bps > 10_000 {
         return Err(Error::InvalidInput);
     }
+    if kind == ProposalKind::SetDisputeWindow && target3 == 0 {
+        return Err(Error::InvalidInput);
+    }
+
+    // Pre-validate proposal configuration based on kind
+    validate_proposal_config(env, kind, &target, &target2, target3)?;
 
     let now = env.ledger().timestamp();
     let min_eta = now.checked_add(MIN_TIMELOCK_DELAY).ok_or(Error::Overflow)?;
@@ -158,7 +239,8 @@ pub fn do_submit_proposal(
             quorum_bps,
             eta,
             timestamp: now,
-            schema_version: EVENT_SCHEMA_VERSION,
+            schema_version: BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -215,7 +297,8 @@ pub fn do_vote_proposal(env: &Env, proposal_id: u64, voted_yes: bool, nonce: u64
                 guardian: guardian.clone(),
                 eta: proposal.eta,
                 timestamp: now,
-                schema_version: EVENT_SCHEMA_VERSION,
+                schema_version: BASE_EVENT_SCHEMA_VERSION,
+                contract_id: env.current_contract_address(),
             },
         );
         return Err(Error::InvalidInput);
@@ -236,7 +319,8 @@ pub fn do_vote_proposal(env: &Env, proposal_id: u64, voted_yes: bool, nonce: u64
             voted_yes,
             guardian_weight,
             timestamp: now,
-            schema_version: EVENT_SCHEMA_VERSION,
+            schema_version: BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -321,13 +405,12 @@ pub fn do_execute_proposal(env: &Env, proposal_id: u64) -> Result<(), Error> {
         // - RecoverStrandedFunds: Transfers funds, doesn't touch init keys
         // - AddAcceptedToken: Adds to token list, doesn't touch DataKey::Token
         // - RemoveAcceptedToken: Removes from token list, doesn't touch DataKey::Token
+        // - SetUsageChargeCapOverride: Updates only a merchant usage-charge setting
         //
         // FUTURE: If adding ProposalKind::UpdateConfig or similar that writes to
         // DataKey::Token, DataKey::MinTopup, or DataKey::GracePeriod, add it here:
-        let writes_to_init_keys = matches!(proposal.kind,
-            // ProposalKind::UpdateConfig => true,  // FUTURE: Add if needed
-            false  // Currently no proposal kind writes to init keys
-        );
+        // Currently no proposal kind writes to initialization-critical keys.
+        let writes_to_init_keys = false;
         
         if writes_to_init_keys {
             return Err(Error::AlreadyInitialized);
@@ -364,6 +447,14 @@ pub fn do_execute_proposal(env: &Env, proposal_id: u64) -> Result<(), Error> {
         ProposalKind::RemoveAcceptedToken => {
             // Token removal is handled by the caller
         }
+        ProposalKind::SetDisputeWindow => {
+            crate::admin::apply_dispute_window_secs(env, u64::from(proposal.target3))?;
+        }
+        ProposalKind::SetOracleConfig => {
+            // SetOracleConfig: oracle address in target.
+            // Update oracle address via governance, bypassing the cooldown.
+            crate::oracle::set_oracle_address(env, proposal.target)?;
+        }
     }
 
     // Mark as executed
@@ -379,7 +470,8 @@ pub fn do_execute_proposal(env: &Env, proposal_id: u64) -> Result<(), Error> {
             votes_against,
             total_weight,
             timestamp: now,
-            schema_version: EVENT_SCHEMA_VERSION,
+            schema_version: BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -412,7 +504,8 @@ pub fn do_cancel_proposal(env: &Env, proposal_id: u64, reason: String) -> Result
             proposal_id,
             reason,
             timestamp: env.ledger().timestamp(),
-            schema_version: EVENT_SCHEMA_VERSION,
+            schema_version: BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 

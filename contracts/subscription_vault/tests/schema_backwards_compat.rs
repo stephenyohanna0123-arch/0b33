@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use subscription_vault::EVENT_SCHEMA_VERSION;
+use subscription_vault::{BASE_EVENT_SCHEMA_VERSION, NONCE_CONSUMED_EVENT_SCHEMA_VERSION};
 
 #[derive(Debug, Eq, PartialEq)]
 enum SchemaCompatibilityError {
@@ -67,11 +67,14 @@ fn assert_append_only(
     Ok(())
 }
 
-fn assert_schema_version(snapshot: &str) -> Result<(), SchemaCompatibilityError> {
+fn assert_schema_version(
+    snapshot: &str,
+    expected_version: u32,
+) -> Result<(), SchemaCompatibilityError> {
     let found = schema_version_from_snapshot(snapshot).unwrap_or_default();
-    if found != EVENT_SCHEMA_VERSION {
+    if found != expected_version {
         return Err(SchemaCompatibilityError::VersionMismatch {
-            expected: EVENT_SCHEMA_VERSION,
+            expected: expected_version,
             found,
         });
     }
@@ -87,8 +90,9 @@ fn subscription_created_v1_fixture_is_strict_prefix_of_current_schema() {
 
     assert_append_only(&v1, &current).expect("current schema must preserve v1 field order");
     assert!(current.len() > v1.len(), "current schema must append fields");
-    assert_eq!(current.last().map(String::as_str), Some("schema_version"));
-    assert_schema_version(current_snapshot).expect("fixture must carry the current version");
+    assert_eq!(current.last().map(String::as_str), Some("contract_id"));
+    assert_schema_version(current_snapshot, BASE_EVENT_SCHEMA_VERSION)
+        .expect("fixture must carry the event type's version");
 }
 
 #[test]
@@ -99,8 +103,9 @@ fn nonce_consumed_v1_fixture_is_strict_prefix_of_current_schema() {
 
     assert_append_only(&v1, &current).expect("current schema must preserve v1 field order");
     assert!(current.len() > v1.len(), "current schema must append fields");
-    assert_eq!(current.last().map(String::as_str), Some("batch_nonce"));
-    assert_schema_version(current_snapshot).expect("fixture must carry the current version");
+    assert_eq!(current.last().map(String::as_str), Some("contract_id"));
+    assert_schema_version(current_snapshot, NONCE_CONSUMED_EVENT_SCHEMA_VERSION)
+        .expect("fixture must carry the event type's version");
 }
 
 #[test]
@@ -151,7 +156,7 @@ fn version_mismatch_is_reported_as_schema_break() {
     assert_eq!(
         assert_schema_version(stale_snapshot),
         Err(SchemaCompatibilityError::VersionMismatch {
-            expected: EVENT_SCHEMA_VERSION,
+            expected: BASE_EVENT_SCHEMA_VERSION,
             found: 1,
         })
     );

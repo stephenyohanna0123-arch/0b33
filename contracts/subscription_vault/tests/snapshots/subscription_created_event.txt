@@ -9,4 +9,5 @@ data:
   lifetime_cap: <Option<i128>>
   expires_at: <Option<u64>>
   timestamp: <u64>
-  schema_version: 4
+  schema_version: 3
+  contract_id: <Address>

@@ -8,12 +8,9 @@ use crate::types::{
     AcceptedToken, AdminConfigChangedEvent, AdminProposal, AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent, BatchChargeResult,
     DataKey, Error, FeeTokenConfiguredEvent, PendingTreasuryChange, RecoveryEvent,
-    RecoveryInitiatorRole, RecoveryReason,
-    SchemaMigrationSummary, TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, BATCH_MAX_SIZE,
+    RecoveryInitiatorRole, RecoveryReason, SchemaMigrationSummary, Subscription, SubscriptionStatus,
+    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, BATCH_MAX_SIZE, MAX_PROTOCOL_FEE_BIPS,
     TOPIC_RECOVERY, SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
-    Subscription,
-    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, BATCH_MAX_SIZE, TOPIC_RECOVERY, SUB_TTL_EXTEND_TO,
-    SUB_TTL_THRESHOLD,
 };
 use crate::{
     charge_core::{charge_one, charge_usage_one},
@@ -96,7 +93,7 @@ pub const CONFIG_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 /// collision-free `BytesN<32>` used as the persistent-storage key for the
 /// per-config-key cooldown timestamp.
 fn hash_key_label(env: &Env, key_label: &str) -> soroban_sdk::BytesN<32> {
-    let label_bytes = Bytes::from_array(env, key_label.as_bytes());
+    let label_bytes = Bytes::from_slice(env, key_label.as_bytes());
     env.crypto().sha256(&label_bytes).into()
 }
 
@@ -372,6 +369,44 @@ pub fn get_grace_period(env: &Env) -> Result<u64, Error> {
     read_config(env, &DataKey::GracePeriod).ok_or(Error::NotInitialized)
 }
 
+/// Set the global dispute response window. Admin updates are rate-limited;
+/// guardian-approved governance proposals intentionally bypass that cooldown.
+pub fn do_set_dispute_window_secs(
+    env: &Env,
+    admin: Address,
+    window_secs: u64,
+) -> Result<(), Error> {
+    require_admin_auth(env, &admin)?;
+    enforce_config_cooldown(env, "DisputeWindowSecs")?;
+    apply_dispute_window_secs(env, window_secs)
+}
+
+/// Return the configured dispute response window, or the historical 14-day default.
+pub fn get_dispute_window_secs(env: &Env) -> u64 {
+    read_config(env, &DataKey::DisputeWindowSecs)
+        .unwrap_or(crate::types::DISPUTE_WINDOW_SECS)
+}
+
+/// Apply a validated dispute-window value. Used by direct admin and governance paths.
+pub(crate) fn apply_dispute_window_secs(env: &Env, window_secs: u64) -> Result<(), Error> {
+    if window_secs == 0 || window_secs > u64::from(u32::MAX) {
+        return Err(Error::InvalidInput);
+    }
+
+    let old_window_secs = get_dispute_window_secs(env);
+    write_config(env, &DataKey::DisputeWindowSecs, &window_secs);
+    env.events().publish(
+        (Symbol::new(env, "dispute_window_updated"),),
+        crate::types::DisputeWindowUpdatedEvent {
+            old_window_secs,
+            new_window_secs: window_secs,
+            timestamp: env.ledger().timestamp(),
+            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        },
+    );
+    Ok(())
+}
+
 pub fn do_set_subscriber_create_cap(env: &Env, admin: Address, cap: u32) -> Result<(), Error> {
     require_admin_auth(env, &admin)?;
     write_config(env, &DataKey::SubscriberCreateCap, &cap);
@@ -443,6 +478,21 @@ pub fn remove_accepted_token(env: &Env, admin: Address, token: Address) -> Resul
         return Err(Error::InvalidInput);
     }
 
+    // A token cannot be removed while any live subscription still references
+    // it; otherwise existing subscriptions could become unchargeable.
+    let token_ids: Vec<u32> = env
+        .storage()
+        .instance()
+        .get(&DataKey::TokenSubs(token.clone()))
+        .unwrap_or(Vec::new(env));
+    for id in token_ids.iter() {
+        if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(id)) {
+            if matches!(sub.status, SubscriptionStatus::Active | SubscriptionStatus::GracePeriod) {
+                return Err(Error::InvalidStatusTransition);
+            }
+        }
+    }
+
     // Require multi-sig approval for removing tokens
     let proposal_id = require_multisig_approval(
         env,
@@ -512,14 +562,15 @@ pub(crate) fn read_cached_admin_config(env: &Env) -> Result<CachedAdminConfig, E
     })
 }
 
-/// Execute the core batch-charge loop without any auth or nonce checks.
+/// Execute the core batch-charge loop without auth or nonce advancement.
 ///
 /// Called by both `do_batch_charge` (admin path) and
-/// `operator::do_operator_batch_charge` (operator path) after their respective
-/// auth/nonce guards have been satisfied.
+/// `operator::do_operator_batch_charge` (operator path) after authorization and
+/// nonce validation have been satisfied.
 pub(crate) fn execute_batch_charge(
     env: &Env,
     subscription_ids: &Vec<u32>,
+    idem_keys: Option<&Vec<soroban_sdk::BytesN<32>>>,
 ) -> Vec<BatchChargeResult> {
     let now = env.ledger().timestamp();
     // Read all admin config values once so they are cached across the batch loop.
@@ -531,35 +582,46 @@ pub(crate) fn execute_batch_charge(
     // Cache oracle prices per (merchant, token) pair so subscriptions sharing a
     // merchant and token within the batch don't redundantly re-query the oracle.
     let mut price_cache: std::vec::Vec<(Address, Address, u128)> = std::vec::Vec::new();
-    for id in subscription_ids.iter() {
+    for (idx, id) in subscription_ids.iter().enumerate() {
         let admin_ref = match &cached_admin {
             Ok(cfg) => Some(cfg),
             Err(_) => None,
         };
-        let r = charge_one(env, id, now, None, admin_ref, Some(&mut merchant_cache));
+        // Extract the per-subscription idempotency key for this position, if
+        // the caller supplied an idem_keys vector.  A missing entry at index
+        // `idx` (shorter keys vec) is silently treated as no key for that ID.
+        let idem_key: Option<soroban_sdk::BytesN<32>> = idem_keys
+            .and_then(|keys| keys.get(idx as u32));
+        let r = charge_one(env, id, now, idem_key, admin_ref, Some(&mut merchant_cache));
         let res = match r {
             Ok(ChargeExecutionResult::Charged) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             Ok(ChargeExecutionResult::InsufficientBalance) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: Error::InsufficientBalance.to_code(),
             },
             Ok(ChargeExecutionResult::LifetimeCapReached) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: Error::LifetimeCapReached.to_code(),
             },
             Ok(ChargeExecutionResult::ScheduledCancellation) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             // auto_renew=false and interval elapsed: silently skip without error.
             Ok(ChargeExecutionResult::Skipped) => BatchChargeResult {
+                subscription_id: id,
                 success: true,
                 error_code: 0,
             },
             Err(e) => BatchChargeResult {
+                subscription_id: id,
                 success: false,
                 error_code: e.to_code(),
             },
@@ -573,9 +635,9 @@ pub(crate) fn execute_batch_charge(
 ///
 /// # Input validation
 ///
-/// Both argument-shape checks run *before* the nonce is consumed, so a
-/// malformed batch is a total no-op: no state is mutated and the caller's
-/// nonce is still valid for a corrected retry.
+/// Input validation runs before charge processing. The nonce is validated
+/// before processing, then consumed only if at least one result succeeds.
+/// An all-failure batch leaves the nonce available for a corrected retry.
 ///
 /// 1. **Batch length** — at most [`BATCH_MAX_SIZE`] ids. Larger batches are
 ///    rejected with [`Error::InvalidInput`]. This is a contract-level guard,
@@ -592,8 +654,22 @@ pub(crate) fn execute_batch_charge(
 pub fn do_batch_charge(
     env: &Env,
     subscription_ids: &Vec<u32>,
+    idem_keys: Option<&Vec<soroban_sdk::BytesN<32>>>,
     nonce: u64,
 ) -> Result<Vec<BatchChargeResult>, Error> {
+    let response = do_batch_charge_detailed(env, subscription_ids, idem_keys, nonce)?;
+    if response.duplicate_id.is_some() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(response.results)
+}
+
+pub fn do_batch_charge_detailed(
+    env: &Env,
+    subscription_ids: &Vec<u32>,
+    idem_keys: Option<&Vec<soroban_sdk::BytesN<32>>>,
+    nonce: u64,
+) -> Result<crate::types::BatchChargeResponse, Error> {
     let admin = require_stored_admin_auth(env)?;
 
     // Validate batch size before processing. Reported as InvalidInput so the
@@ -606,32 +682,53 @@ pub fn do_batch_charge(
 
     // Empty batch is allowed as a no-op
     if subscription_ids.len() == 0 {
-        return Ok(Vec::new(env));
+        return Ok(crate::types::BatchChargeResponse {
+            results: Vec::new(env),
+            duplicate_id: None,
+        });
+    }
+
+    // When idem_keys are supplied their count must match subscription_ids exactly
+    // so that each key maps unambiguously to one ID by position.
+    if let Some(keys) = idem_keys {
+        if keys.len() != subscription_ids.len() {
+            return Err(Error::InvalidInput);
+        }
     }
 
     // Check for duplicate IDs and reject the entire batch if found
     let mut seen_ids = soroban_sdk::Vec::<u32>::new(env);
     for id in subscription_ids.iter() {
         if seen_ids.contains(&id) {
-            return Err(Error::InvalidInput); // Clear error for duplicate IDs
+            return Ok(crate::types::BatchChargeResponse {
+                results: Vec::new(env),
+                duplicate_id: Some(id),
+            });
         }
         seen_ids.push_back(id);
     }
 
-    // Nonce check must run after input validation but before any state mutation to prevent replay.
-    // Domain DOMAIN_BATCH_CHARGE separates this counter from other admin ops.
+    // Validate the nonce before processing, then consume it only if at least
+    // one per-item result succeeds. The entrypoint's reentrancy lock protects
+    // this deferred advance while charges perform external token calls.
+    crate::nonce::validate_nonce(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)?;
     let batch_nonce_key = Symbol::new(env, BATCH_NONCE_CONTEXT);
     env.storage().instance().set(&batch_nonce_key, &nonce);
-    if let Err(error) =
-        crate::nonce::check_and_advance(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)
-    {
-        env.storage().instance().remove(&batch_nonce_key);
-        return Err(error);
-    }
 
-    let results = execute_batch_charge(env, subscription_ids);
+    let results = execute_batch_charge(env, subscription_ids, idem_keys);
+    if results.iter().any(|result| result.success) {
+        if let Err(error) =
+            crate::nonce::check_and_advance(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)
+        {
+            env.storage().instance().remove(&batch_nonce_key);
+            return Err(error);
+        }
+    }
     env.storage().instance().remove(&batch_nonce_key);
-    Ok(results)
+    Ok(crate::types::BatchChargeResponse {
+        results,
+        duplicate_id: None,
+    })
 }
 
 /// Performs a single interval-based charge. Admin only.
@@ -1174,6 +1271,7 @@ fn count_legacy_config_keys(env: &Env) -> u32 {
         DataKey::Admin,
         DataKey::MinTopup,
         DataKey::GracePeriod,
+        DataKey::DisputeWindowSecs,
         DataKey::NextId,
         DataKey::EmergencyStop,
         DataKey::Treasury,
@@ -1181,7 +1279,7 @@ fn count_legacy_config_keys(env: &Env) -> u32 {
         DataKey::Operator,
         DataKey::SchemaVersion,
     ];
-    keys.iter().filter(|key| instance.has(key)).count() as u32
+    keys.iter().filter(|key| instance.has(*key)).count() as u32
 }
 
 fn count_rewriteable_subscriptions(env: &Env) -> u32 {
@@ -1225,12 +1323,12 @@ fn plan_schema_migration(
         } else {
             0
         },
-        subscriptions_for_ledger_expiration: if needs_ledger_expiration_rewrite {
+        subs_for_ledger_expiry: if needs_ledger_expiration_rewrite {
             subscription_count
         } else {
             0
         },
-        subscriptions_for_sub_account_label: if needs_sub_account_label_rewrite {
+        subs_for_sub_account_label: if needs_sub_account_label_rewrite {
             subscription_count
         } else {
             0
@@ -1274,6 +1372,19 @@ pub fn do_migrate_config_to_persistent_internal(env: &Env) -> Result<(), Error> 
         persistent.set(&DataKey::GracePeriod, &val);
         crate::subscription::maybe_extend_ttl(env, &DataKey::GracePeriod, SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO);
         instance.remove(&DataKey::GracePeriod);
+    }
+
+    // DisputeWindowSecs
+    if instance.has(&DataKey::DisputeWindowSecs) {
+        let val: u64 = instance.get(&DataKey::DisputeWindowSecs).unwrap_or(0);
+        persistent.set(&DataKey::DisputeWindowSecs, &val);
+        crate::subscription::maybe_extend_ttl(
+            env,
+            &DataKey::DisputeWindowSecs,
+            SUB_TTL_THRESHOLD,
+            SUB_TTL_EXTEND_TO,
+        );
+        instance.remove(&DataKey::DisputeWindowSecs);
     }
 
     // 5. NextId
@@ -1468,7 +1579,7 @@ pub fn do_migrate(
             // would otherwise fail to deserialize and every `get_subscription`
             // call would panic after the binary upgrade.
             (3, _) => {
-                summary.subscriptions_for_ledger_expiration =
+                summary.subs_for_ledger_expiry =
                     rewrite_subscriptions_for_ledger_expiration(env);
                 current = 4;
             }
@@ -1476,7 +1587,7 @@ pub fn do_migrate(
             // `sub_account_label: Option<Symbol>` field deserializes cleanly
             // for subscriptions created before STORAGE_VERSION 5.
             (4, _) => {
-                summary.subscriptions_for_sub_account_label =
+                summary.subs_for_sub_account_label =
                     rewrite_subscriptions_for_sub_account_label(env);
                 current = 5;
             }

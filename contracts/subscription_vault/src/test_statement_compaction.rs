@@ -5,7 +5,7 @@
 //! still be independently queryable — nothing lost, nothing double-counted.
 
 use crate::statements::{compact_subscription_statements, get_compacted_aggregate};
-use crate::types::BillingChargeKind;
+use crate::types::{BillingChargeKind, BillingRetentionConfig, DataKey};
 use crate::{SubscriptionVault, SubscriptionVaultClient};
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
@@ -185,7 +185,10 @@ fn falls_back_to_global_retention_config() {
     append_known_sequence(&env, &contract_id, sub_id, 8);
 
     env.as_contract(&contract_id, || {
-        crate::statements::set_retention_config(&env, 3);
+        env.storage().instance().set(
+            &DataKey::BillingRetentionConfig,
+            &BillingRetentionConfig { keep_recent: 3 },
+        );
     });
 
     let summary = env.as_contract(&contract_id, || {
@@ -193,6 +196,46 @@ fn falls_back_to_global_retention_config() {
     });
     assert_eq!(summary.kept_count, 3);
     assert_eq!(summary.pruned_count, 5);
+}
+
+/// Reducing global retention compacts every allocated subscription and keeps
+/// the statement index and aggregate in sync.
+#[test]
+fn lowering_retention_compacts_all_subscription_indices() {
+    let (env, contract_id) = setup();
+    let admin = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::NextId, &2u32);
+        crate::statements::set_retention_config(&env, &admin, 10).unwrap();
+    });
+
+    append_known_sequence(&env, &contract_id, 0, 5);
+    append_known_sequence(&env, &contract_id, 1, 4);
+
+    env.as_contract(&contract_id, || {
+        crate::statements::set_retention_config(&env, &admin, 2).unwrap();
+    });
+
+    for (subscription_id, expected_pruned) in [(0, 3), (1, 2)] {
+        let page = env.as_contract(&contract_id, || {
+            crate::statements::get_statements_by_subscription_offset(
+                &env,
+                subscription_id,
+                0,
+                10,
+                false,
+            )
+            .unwrap()
+        });
+        assert_eq!(page.total, 2);
+        assert_eq!(page.statements.len(), 2);
+
+        let aggregate = env.as_contract(&contract_id, || {
+            get_compacted_aggregate(&env, subscription_id)
+        });
+        assert_eq!(aggregate.pruned_count, expected_pruned);
+    }
 }
 
 /// INVARIANT: After compaction, sum(retained statements) + compacted_aggregate.total_amount

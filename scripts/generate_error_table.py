@@ -137,6 +137,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "UsageCapExceeded":               ("Retry only after new billing period begins or cap is raised.", "UsageLimitsConfiguredEvent", False),
     "BurstLimitExceeded":             ("Retry after burst_min_interval_secs elapses.", "UsageLimitsConfiguredEvent", False),
     "SubscriberRateLimited":         ("Retry after the subscriber creation rate window resets; check get_subscriber_create_window.", "—", False),
+    "IdemBufferFull":                 ("All 64 idempotency slots are occupied by live (non-expired) entries. Wait until the oldest entry's TTL elapses (up to 7 days from its insertion timestamp) before retrying. Under normal billing cadences this error cannot occur; if seen, investigate abnormally high charge frequency on this subscription.", "—", False),
     # Merchant config
     "InvalidFeeBips":                 ("Fix fee_bips to be in range [0, 10000].", "MerchantConfigUpdatedEvent", False),
     "InvalidOperations":              ("Fix allowed_operations bitmap to use only valid OP_* bits.", "MerchantConfigUpdatedEvent", False),
@@ -163,6 +164,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "DisputeAlreadyResponded":        ("Dispute is not in `Open` status; cannot respond twice.", "DisputeRespondedEvent", False),
     "DisputeOverpay":                  ("Fix the resolution split so total disbursed does not exceed the escrowed amount.", "DisputeResolvedEvent", False),
     "SubscriberHasOpenDisputes":      ("Resolve the subscriber's open disputes before requesting blocklist removal.", "DisputeResolvedEvent", False),
+    "DisputeAmountExceedsMerchantBalance": ("Fix the dispute resolution amount; merchant balance is insufficient to cover the payout.", "DisputeResolvedEvent", False),
     # Subscription transfer (11000-11099)
     "TransferIntentNotFound":         ("Verify transfer initiation or expiry before retrying.", "—", False),
     "TransferIntentExpired":          ("Transfer intent has expired; initiate a new transfer.", "—", False),

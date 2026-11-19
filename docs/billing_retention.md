@@ -5,22 +5,21 @@ This document covers retention and compaction for the **per-charge audit log**
 `PeriodBillingStatement`) are stored separately and are **not** affected by
 compaction — see `docs/billing_statements.md`.
 
-This contract supports bounded billing-statement growth using configurable retention and explicit compaction.
+This contract supports configurable retention and explicit compaction for billing statements.
 
 ## Retention model
 
 - Detailed rows are append-only per subscription, keyed by sequence.
-- `set_billing_retention(admin, keep_recent)` configures the default number of detailed rows to keep.
+- `set_billing_retention(admin, keep_recent)` configures the default number of detailed rows to keep during compaction.
 - `get_billing_retention()` returns current policy.
-
-Default policy keeps all rows until retention is explicitly set.
+- Statements are not pruned on append. The first retention setting and each reduction compact existing histories; explicit compaction is needed to enforce the policy on later appends.
 
 ## Compaction flow
 
-- **Inline pruning**: Every new statement appended (`charge_subscription`, `charge_one_off`, etc.) automatically checks the global `keep_recent` threshold. If exceeded, the oldest row is pruned inline to cap storage growth dynamically without manual intervention.
 - **Explicit compaction**: `compact_billing_statements(admin, subscription_id, keep_recent_override)`
   - Admin-only operation
-  - Prunes oldest detailed rows beyond keep threshold in bulk (useful when global retention is lowered or when using an override)
+  - Prunes oldest detailed rows for one subscription (useful for per-run overrides or targeted cleanup)
+- **Retention reduction**: lowering `keep_recent` with `set_billing_retention` immediately compacts all allocated subscription histories in the same transaction. Each affected history emits `billing_compacted`; pruned amounts remain available in its aggregate.
 - Preserves high-level auditability in `BillingStatementAggregate`:
   - `pruned_count`
   - `total_amount`
@@ -39,7 +38,8 @@ Read aggregate with `get_stmt_compacted_aggregate(subscription_id)`.
 ## Guidance
 
 - Choose `keep_recent` to match frontend history window (for example, 12-24 periods).
-- Inline pruning automatically maintains this bound. Explicit compaction is only needed if retention policies are dynamically lowered and immediate cleanup is required.
+- A retention reduction performs an immediate global cleanup. This pass scans subscription IDs and can be resource-intensive on contracts with many subscriptions; the config update and cleanup are atomic, so a failed cleanup leaves the old policy in place.
+- Explicit compaction may be needed after additional statements are appended under the configured policy, because appends do not compact automatically.
 
 ## Security and operations
 
